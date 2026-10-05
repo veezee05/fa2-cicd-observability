@@ -1,0 +1,98 @@
+# Full runtime stack: the application plus the observability layer.
+# Deployed to EC2 by Ansible, which renders ${APP_IMAGE} from the tag the
+# CI pipeline just pushed.
+
+services:
+  # ---------------------------------------------------------- application
+  app:
+    image: ${APP_IMAGE:-ghcr.io/veezee05/fa2-lost-and-found:latest}
+    container_name: lost-and-found
+    restart: always
+    ports:
+      - "80:80"
+    networks: [obs]
+
+  # ------------------------------------------------------------- metrics
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: always
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [obs]
+
+  # Host-level metrics: CPU, memory, disk, network.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    restart: always
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+    networks: [obs]
+
+  # Translates nginx stub_status into Prometheus metrics.
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.3.0
+    container_name: nginx-exporter
+    restart: always
+    command:
+      - --nginx.scrape-uri=http://app:8080/stub_status
+    depends_on: [app]
+    networks: [obs]
+
+  # Synthetic probing — this is what produces the availability and latency
+  # SLIs the SLOs in docs/SRE.md are measured against.
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: blackbox-exporter
+    restart: always
+    volumes:
+      - ./prometheus/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    networks: [obs]
+
+  # ------------------------------------------------------------- alerting
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    restart: always
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    networks: [obs]
+
+  # ---------------------------------------------------- visualisation
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: always
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-devops2026}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [obs]
+
+networks:
+  obs:
+    driver: bridge
+
+volumes:
+  prom-data:
+  grafana-data:

@@ -1,0 +1,38 @@
+global:
+  resolve_timeout: 5m
+
+# Routing tree: critical pages immediately and repeats; warnings are
+# grouped and repeat slowly so they do not become noise.
+route:
+  receiver: default
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: critical
+      group_wait: 10s
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+
+  - name: critical
+    # A webhook stands in for the paging integration (PagerDuty, Opsgenie,
+    # Slack) a production setup would use. Alertmanager's behaviour —
+    # grouping, inhibition, routing — is identical either way.
+    webhook_configs:
+      - url: http://alertmanager:9093/-/noop
+        send_resolved: true
+
+# Suppress the noisy downstream alerts once the service is confirmed down —
+# if the app is unreachable, a latency alert adds nothing.
+inhibit_rules:
+  - source_matchers:
+      - alertname = "ApplicationDown"
+    target_matchers:
+      - alertname = "HighResponseLatency"
+    equal: ['instance']

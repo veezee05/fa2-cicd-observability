@@ -1,0 +1,11 @@
+*.pem
+*.csv
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.retry
+.env
+node_modules/
+__pycache__/
+*.pyc

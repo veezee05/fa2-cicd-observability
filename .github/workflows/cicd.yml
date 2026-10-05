@@ -1,0 +1,171 @@
+name: CI/CD Pipeline
+
+# Pipeline as Code (Unit III): the entire build-test-deploy loop is defined
+# in version control alongside the application it ships.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # lets you trigger a run by hand for the demo
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------- STAGE 1
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+          failure-threshold: warning
+
+      - name: Check the HTML parses
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq tidy
+          # tidy exits 1 on warnings, 2 on errors — only fail on errors
+          tidy -q -e app/index.html; [ $? -lt 2 ]
+
+  # ---------------------------------------------------------------- STAGE 2
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run unit tests
+        working-directory: app
+        run: npm test
+
+  # ---------------------------------------------------------------- STAGE 3
+  build:
+    name: Build & smoke test image
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t lost-and-found:${{ github.sha }} app/
+
+      # An image that builds is not the same as an image that works.
+      - name: Smoke test the running container
+        run: |
+          docker run -d --name smoke -p 8080:80 -p 8081:8080 lost-and-found:${{ github.sha }}
+
+          echo "waiting for nginx..."
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          echo "--- status code ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/)
+          test "$code" = "200" || { echo "expected 200, got $code"; exit 1; }
+
+          echo "--- page content ---"
+          curl -s http://localhost:8080/ | grep -q "Campus Lost &amp; Found Portal" \
+            || { echo "page title missing"; exit 1; }
+
+          echo "--- JS module is served ---"
+          curl -fsS http://localhost:8080/src/items.js | grep -q "export function filterItems" \
+            || { echo "items.js not served"; exit 1; }
+
+          echo "--- nginx metrics endpoint is up ---"
+          curl -fsS http://localhost:8081/stub_status | grep -q "Active connections" \
+            || { echo "stub_status not responding"; exit 1; }
+
+          echo "all smoke tests passed"
+          docker rm -f smoke
+
+      - name: Log in to the container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push
+        id: meta
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker tag lost-and-found:${{ github.sha }} $IMAGE:${{ github.sha }}
+          docker tag lost-and-found:${{ github.sha }} $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------- STAGE 4
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible and the AWS SDK
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible boto3 botocore
+          ansible-galaxy collection install amazon.aws
+
+      - name: Restore the SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/fa2-key.pem
+          chmod 400 ~/.ssh/fa2-key.pem
+
+      # Dynamic inventory (carried over from FA1): the runner has no idea
+      # what the instance IP is — it asks the AWS API at deploy time.
+      - name: Deploy with Ansible
+        working-directory: ansible
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ap-south-1
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-inventory -i aws_ec2.yml --graph
+          ansible-playbook -i aws_ec2.yml deploy.yml \
+            -e "app_image=${{ needs.build.outputs.image }}:${{ github.sha }}" \
+            -e "ansible_ssh_private_key_file=~/.ssh/fa2-key.pem"
+
+  # ---------------------------------------------------------------- STAGE 5
+  verify:
+    name: Post-deploy health check
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the AWS SDK
+        run: pip install boto3 botocore
+
+      # Confirms the deployment actually serves traffic, not just that
+      # the playbook exited zero.
+      - name: Probe the live endpoint
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ap-south-1
+        run: python scripts/verify_deployment.py

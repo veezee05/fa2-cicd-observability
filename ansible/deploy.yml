@@ -1,0 +1,121 @@
+---
+# Deploys the application together with its observability stack.
+# Called by the CI/CD pipeline, and runnable by hand for the demo.
+
+- name: Deploy Lost & Found with observability
+  hosts: role_web
+  become: true
+
+  tasks:
+    # ------------------------------------------------------- prerequisites
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Docker and the Compose plugin
+      apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+        state: present
+
+    - name: Ensure Docker is running and enabled at boot
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add ubuntu to the docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: true
+
+    # --------------------------------------------------------- stack files
+    - name: Create the stack directory
+      file:
+        path: "{{ stack_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy the monitoring stack
+      copy:
+        src: "{{ playbook_dir }}/../monitoring/"
+        dest: "{{ stack_dir }}/"
+        owner: ubuntu
+        group: ubuntu
+      notify: restart stack
+
+    - name: Write the environment file
+      copy:
+        dest: "{{ stack_dir }}/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+        content: |
+          APP_IMAGE={{ app_image }}
+          GRAFANA_PASSWORD={{ grafana_password }}
+      notify: restart stack
+
+    # ------------------------------------------------------------- deploy
+    - name: Pull the application image
+      command: docker pull {{ app_image }}
+      register: pull_result
+      changed_when: "'Downloaded newer image' in pull_result.stdout"
+      # A public GHCR image needs no auth; a private one needs a docker login
+      # task here using a registry token.
+
+    - name: Bring the stack up
+      command: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ stack_dir }}"
+      register: compose_up
+      changed_when: "'Started' in compose_up.stderr or 'Created' in compose_up.stderr"
+
+    # -------------------------------------------------------- verification
+    - name: Wait for the application to serve traffic
+      uri:
+        url: http://127.0.0.1/
+        status_code: 200
+      register: app_check
+      retries: 12
+      delay: 5
+      until: app_check.status == 200
+
+    - name: Wait for Prometheus to be ready
+      uri:
+        url: http://127.0.0.1:9090/-/ready
+        status_code: 200
+      register: prom_check
+      retries: 12
+      delay: 5
+      until: prom_check.status == 200
+
+    - name: Wait for Grafana to be healthy
+      uri:
+        url: http://127.0.0.1:3000/api/health
+        status_code: 200
+      register: graf_check
+      retries: 12
+      delay: 5
+      until: graf_check.status == 200
+
+    - name: Report what is running
+      command: docker compose ps
+      args:
+        chdir: "{{ stack_dir }}"
+      register: ps_out
+      changed_when: false
+
+    - name: Show stack status
+      debug:
+        var: ps_out.stdout_lines
+
+  handlers:
+    - name: restart stack
+      command: docker compose up -d --force-recreate
+      args:
+        chdir: "{{ stack_dir }}"

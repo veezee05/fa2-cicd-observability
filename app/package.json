@@ -1,0 +1,10 @@
+{
+  "name": "lost-and-found",
+  "version": "2.0.0",
+  "description": "Campus Lost & Found portal — FA2 CI/CD and observability",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
