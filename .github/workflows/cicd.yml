@@ -137,6 +137,28 @@ jobs:
 
       # Dynamic inventory (carried over from FA1): the runner has no idea
       # what the instance IP is — it asks the AWS API at deploy time.
+      #
+      # Guard first. ansible-playbook exits 0 when the host pattern matches
+      # nothing, so without this check a deploy against zero hosts reports
+      # success while doing nothing at all.
+      - name: Check a deployment target exists
+        working-directory: ansible
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ap-south-1
+        run: |
+          ansible-inventory -i aws_ec2.yml --graph
+
+          COUNT=$(ansible-inventory -i aws_ec2.yml --list 2>/dev/null \
+            | python -c "import json,sys; print(len(json.load(sys.stdin).get('_meta',{}).get('hostvars',{})))")
+
+          echo "hosts discovered: $COUNT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::Dynamic inventory returned no hosts. Is the EC2 instance running and tagged Project=lost-and-found-fa2? Run 'terraform apply' before deploying."
+            exit 1
+          fi
+
       - name: Deploy with Ansible
         working-directory: ansible
         env:
@@ -145,10 +167,9 @@ jobs:
           AWS_DEFAULT_REGION:    ap-south-1
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
-          ansible-inventory -i aws_ec2.yml --graph
           ansible-playbook -i aws_ec2.yml deploy.yml \
             -e "app_image=${{ needs.build.outputs.image }}:${{ github.sha }}" \
-            -e "ansible_ssh_private_key_file=~/.ssh/fa2-key.pem"
+            -e "ansible_ssh_private_key_file=$HOME/.ssh/fa2-key.pem"
 
   # ---------------------------------------------------------------- STAGE 5
   verify:
